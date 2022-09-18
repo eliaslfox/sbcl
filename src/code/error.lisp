@@ -94,9 +94,10 @@
                       (when (and (eq (car handler) 'function) (sb-c:policy env (= safety 3)))
                         ;; Referencing #'F is enough to get a compile-time warning about unknown
                         ;; functions, but the use itself is flushable, so employ SAFE-FDEFN-FUN.
-                        (dummy-forms `(sb-c:safe-fdefn-fun
-                                       (load-time-value
-                                        (find-or-create-fdefn ',name) t))))
+                        (dummy-forms #+linker-space `(symbol-function ',name) ; won't be flushed
+                                     #-linker-space
+                                     `(sb-c:safe-fdefn-fun
+                                       (load-time-value (find-or-create-fdefn ',name) t))))
                       `(load-time-value
                         (cons ,test (the (function-designator (condition)) ',name))
                         t)))))

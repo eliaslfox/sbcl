@@ -505,8 +505,13 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 
 lispobj symbol_function(struct symbol* symbol)
 {
+#ifdef LISP_FEATURE_LINKER_SPACE
+    lispobj func = decode_fname_taggedfun(symbol->func);
+    return func ? func : NIL;
+#else
     if (symbol->fdefn) return FDEFN(symbol->fdefn)->fun;
     return NIL;
+#endif
 }
 
 static void print_fun_or_otherptr(lispobj obj)
@@ -576,6 +581,9 @@ static void print_fun_or_otherptr(lispobj obj)
         int pkgid = symbol_package_id(sym) << N_FIXNUM_TAG_BITS;
         print_obj("package_id: ", pkgid);
 #endif
+        int fname_index = extract_fname_index(sym->func);
+        printf("\nindex: %x linkage_table[index]: %p",
+               fname_index, (void*)lisp_linkage_table[fname_index]);
         break;
 
 #if N_WORD_BITS == 32
@@ -724,7 +732,7 @@ static void print_fun_or_otherptr(lispobj obj)
 
     case FDEFN_WIDETAG:
         print_slots(fdefn_slots, 2, ptr);
-        print_obj("entry: ", decode_fdefn_rawfun((struct fdefn*)(ptr-1)));
+        //        print_obj("entry: ", decode_fdefn_rawfun((struct fdefn*)(ptr-1)));
         break;
 
     // Make some vectors printable from C, for when all hell breaks lose

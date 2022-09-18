@@ -61,9 +61,6 @@
           ;; the DEFCONSTANT of the same name, hence the suffix.
           &key ((:dynamic-space-start dynamic-space-start*))
                ((:dynamic-space-size dynamic-space-size*))
-               ;; The immobile-space START parameters should not be used
-               ;; except in forcing discontiguous addresses for testing.
-               ;; And of course, don't use them if unsupported.
                ((:fixedobj-space-start fixedobj-space-start*))
                ((:fixedobj-space-size  fixedobj-space-size*) (* 24 1024 1024))
                ((:text-space-start text-space-start*))
@@ -95,7 +92,6 @@
                            (static-code ,small-space-size))
                          #+immobile-space
                          `((fixedobj ,fixedobj-space-size*)
-                           (alien-linkage-table ,alien-linkage-table-space-size)
                            (text ,text-space-size*))))
          (ptr small-spaces-start)
          (small-space-forms
@@ -104,7 +100,6 @@
                  (let* ((relocatable
                           ;; READONLY is usually movable now.
                           (member space '(fixedobj text
-                                          #+immobile-space alien-linkage-table
                                           #-darwin-jit read-only)))
                         (start ptr)
                         (end (+ ptr size)))
@@ -222,6 +217,7 @@
     *immobile-codeblob-tree* ; for generations 0 through 5 inclusive
     *immobile-codeblob-vector* ; for pseudo-static-generation
     *dynspace-codeblob-tree*
+    *linkage-table*
 
     ;; stack pointers
     #-sb-thread *binding-stack-start* ; a thread slot if #+sb-thread

@@ -630,3 +630,5 @@
 (defmacro compact-fsc-instance-hash (fin)
   `(sap-ref-32 (int-sap (get-lisp-obj-address ,fin))
                (+ (ash 3 word-shift) 4 (- fun-pointer-lowtag))))
+
+(defconstant symbol-function-bits 40)

@@ -814,7 +814,6 @@
          (emit-label leave-pa)))
       done))) ; label needed by calc-size-in-bytes
 
-#-immobile-space
 (define-vop (make-fdefn)
   (:policy :fast-safe)
   (:translate make-fdefn)
@@ -825,9 +824,12 @@
   (:generator 37
     (alloc-other fdefn-widetag fdefn-size result node nil thread-tn)
     (storew name result fdefn-name-slot other-pointer-lowtag)
-    (storew nil-value result fdefn-fun-slot other-pointer-lowtag)
-    (storew (make-fixup 'undefined-tramp :assembly-routine)
-            result fdefn-raw-addr-slot other-pointer-lowtag)))
+    ;; unbound value is 0, not NIL if #+linker-space
+    #-linker-space
+    (progn
+      (storew nil-value result fdefn-fun-slot other-pointer-lowtag)
+      (storew (make-fixup 'undefined-tramp :assembly-routine)
+              result fdefn-raw-addr-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
   (:info label length stack-allocate-p)
@@ -916,7 +918,7 @@
              (invoke-asm-routine 'call 'alloc-funinstance vop)
              (inst pop result))
             (t
-             (allocation nil bytes (if type 0 lowtag) result node alloc-temp thread-tn)))
+             (allocation type bytes (if type 0 lowtag) result node alloc-temp thread-tn)))
       (let ((header (compute-object-header words type)))
         (cond #+compact-instance-header
               ((and (eq name '%make-structure-instance) stack-allocate-p)

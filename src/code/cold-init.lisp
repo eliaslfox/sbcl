@@ -174,6 +174,7 @@
   (sb-thread::init-main-thread)
 
   ;; not sure why this is needed on some architectures. Dark magic.
+  #-linker-space
   (setf (fdefn-fun (find-or-create-fdefn '%coerce-callable-for-call))
         #'%coerce-callable-to-fun)
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.

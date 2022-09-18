@@ -353,9 +353,6 @@ sufficiently motivated to do lengthy fixes."
   (coalesce-ctypes)
   (drop-all-hash-caches)
   (os-deinit)
-  ;; Perform static linkage. Functions become un-statically-linked
-  ;; on demand, for TRACE, redefinition, etc.
-  #+immobile-code (sb-vm::statically-link-core)
   (invalidate-fd-streams)
   (finalizers-deinit)
   (sb-vm::restore-cpu-specific-routines)

@@ -1038,7 +1038,7 @@
     :alien-code-linkage-index :alien-data-linkage-index
     :foreign :foreign-dataref
     :code-object
-    :layout :immobile-symbol :fdefn-call :static-call
+    :layout :immobile-symbol :static-call :lisp-linkage-index :lisp-linkage-cell
     :symbol-value
     :layout-id)
   #'equalp)
@@ -1101,6 +1101,7 @@
                               flavor data))
            (operand
             (ecase flavor
+              ((:static-call :lisp-linkage-cell :lisp-linkage-index) name)
               ((:code-object :gc-barrier) (the null name))
               (:layout
                (if (symbolp name)
@@ -1121,8 +1122,7 @@
                :immobile-symbol :symbol-value)
                (the symbol name))
               ((:alien-code-linkage-index :alien-data-linkage-index
-                :foreign :foreign-dataref) (the string name))
-              ((:fdefn-call :static-call) name))))
+                :foreign :foreign-dataref) (the string name)))))
       (dump-object info fasl-output)
       (incf nelements (cond (named (dump-object operand fasl-output) 2)
                             (t 1))))))

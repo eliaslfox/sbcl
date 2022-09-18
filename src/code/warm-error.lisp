@@ -75,7 +75,8 @@
   ;; But we would warn about redefinition of STYLE-WARN.
   ;; Do a "gentle" fmakunbound, because real FMAKUNBOUND removes
   ;; sb-c:fun-info thus blowing out the control string transformer.
-  (fdefn-makunbound (find-fdefn 'style-warn))
+  #+linker-space (sb-c::set-fname-function 'style-warn 0) ; preserves the linkage index!
+  #-linker-space (fdefn-makunbound (find-fdefn 'style-warn))
 
   (defun style-warn (datum &rest arguments)
     (declare (explicit-check))

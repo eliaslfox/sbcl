@@ -18,13 +18,7 @@
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
-  #-immobile-space (make-fdefn name)
-  #+immobile-space
-  (let ((fdefn (truly-the (values fdefn &optional)
-                          (sb-vm::alloc-immobile-fdefn))))
-    (sb-vm::%set-fdefn-name fdefn name)
-    (fdefn-makunbound fdefn)
-    fdefn))
+  (make-fdefn name))
 
 (defun (setf fdefn-fun) (fun fdefn)
   (declare (type function fun)
@@ -36,9 +30,12 @@
 ;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
 ;;; Signal an error if name isn't valid.
 ;;; Assume that exists-p implies LEGAL-FUN-NAME-P.
-(declaim (ftype (sfunction ((or symbol list)) (or fdefn null)) find-fdefn))
+;;; If #+linker-space then FDEFNs can only be created for names that aren't symbols.
+(declaim (ftype (sfunction ((or cons #-linker-space symbol)) (or fdefn null)) find-fdefn))
 (defun find-fdefn (name)
   (declare (explicit-check))
+  #+linker-space (aver (not (symbolp name)))
+  #-linker-space
   (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
     (let ((fdefn (sb-vm::%symbol-fdefn name))) ; slot default is 0, not NIL
       (return-from find-fdefn (if (eql fdefn 0) nil fdefn))))
@@ -98,10 +95,12 @@
                   symbol))
           (t def))))
 
-(declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
+(declaim (ftype (sfunction ((or cons #-linker-space symbol)) fdefn) find-or-create-fdefn))
 (defun find-or-create-fdefn (name)
   (cond
     ((symbolp name)
+     #+linker-space (find-fdefn name) ; will signal error
+     #-linker-space
      (let ((fdefn (sb-vm::%symbol-fdefn name)))
        (if (eql fdefn 0)
            (let* ((new (make-fdefn name))
@@ -366,6 +365,11 @@
            :format-control "~S is not acceptable to ~S."
            :format-arguments (list object setter))))
 
+(defmacro fname-fun (x)
+  ;; If #+linker-space, an FNAME is (OR SYMBOL FDEFN), otherwise just FDEFN
+  #+linker-space `(if (symbolp ,x) (%symbol-function ,x) (fdefn-fun ,x))
+  #-linker-space `(fdefn-fun ,x))
+
 (defun (setf fdefinition) (new-value name)
   "Set NAME's global function definition."
   (declare (type function new-value) (optimize (safety 1)))
@@ -387,11 +391,11 @@
                    ;; hash-function
                    (setf (third spec) new-value))))))
 
-    (let ((fdefn (find-or-create-fdefn name)))
+    (let ((fname (if (or #+linker-space (symbolp name)) name (find-or-create-fdefn name))))
       (dolist (f *setf-fdefinition-hook*)
         (declare (type function f))
         (funcall f name new-value))
-      (let ((encap-info (encapsulation-info (fdefn-fun fdefn))))
+      (let ((encap-info (encapsulation-info (fname-fun fname))))
         (cond (encap-info
                (loop
                 (let ((more-info
@@ -402,26 +406,35 @@
                       (return (setf (encapsulation-info-definition encap-info)
                                     new-value))))))
               (t
-               (setf (fdefn-fun fdefn) new-value)))))))
+               (sb-c::set-fname-function fname new-value)))))
+    new-value))
 
 ;;;; FBOUNDP and FMAKUNBOUND
 
 (defun fboundp (name)
   "Return true if name has a global function definition."
   (declare (explicit-check))
-  (awhen (find-fdefn name) (fdefn-fun it)))
+  (acond ((typep name '(and symbol (not null)))
+          ;; un-fboundp symbols have 0, not NIL in the field
+          (let ((f (%primitive sb-vm::fast-symbol-function name))) (if (eql f 0) nil f)))
+         ((null name) nil)
+         ((find-fdefn name) (fdefn-fun it))))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
   (declare (explicit-check))
   (with-single-package-locked-error
       (:symbol name "removing the function or macro definition of ~A")
-    (let ((fdefn (find-fdefn name)))
-      (when fdefn
-        #+immobile-code
-        (when (sb-vm::fdefn-has-static-callers fdefn)
-          (sb-vm::remove-static-links fdefn))
-        (fdefn-makunbound fdefn)))
+    (cond ((symbolp name)
+           (sb-c::set-fname-function name 0))
+          (t
+           (let ((fdefn (find-fdefn name)))
+             (when fdefn
+               (sb-c::set-fname-function fdefn 0)
+               #+immobile-code
+               (when (sb-vm::fdefn-has-static-callers fdefn)
+                 (sb-vm::remove-static-links fdefn))
+               #+nil(fdefn-makunbound fdefn)))))
     (undefine-fun-name name)
     name))
 

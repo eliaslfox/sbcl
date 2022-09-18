@@ -420,6 +420,7 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
 #ifdef LISP_FEATURE_COMPACT_SYMBOL
           case SYMBOL_WIDETAG:
             { // Copied from scav_symbol() in gc-common
+            lose("not done");
             struct symbol* s = (void*)where;
             adjust_pointers(&s->value, 3, adj); // value, function, info
             lispobj name = decode_symbol_name(s->name);
@@ -679,17 +680,22 @@ __attribute__((unused)) static void check_dynamic_space_addr_ok(uword_t start, u
 static os_vm_address_t reserve_space(int space_id, int attr,
                                      os_vm_address_t addr, os_vm_size_t size)
 {
+    int extra_request = 0;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID) {
-        // Carve out the text space from the earlier request that was made
-        // for the fixedobj space.
-        ALIEN_LINKAGE_TABLE_SPACE_START = FIXEDOBJ_SPACE_START + FIXEDOBJ_SPACE_SIZE;
-        return (os_vm_address_t)(ALIEN_LINKAGE_TABLE_SPACE_START + ALIEN_LINKAGE_TABLE_SPACE_SIZE);
+        extra_request = 9*1024*1024; // enough for 1 million global functions + 128k C functions
+        size += extra_request;
+        addr -= extra_request; // try to put text space where truly desired
     }
 #endif
     if (size == 0) return addr;
     addr = os_alloc_gc_space(space_id, attr, addr, size);
     if (!addr) lose("Can't allocate %#"OBJ_FMTX" bytes for space %d", size, space_id);
+    if (space_id == IMMOBILE_TEXT_CORE_SPACE_ID) {
+      ALIEN_LINKAGE_TABLE_SPACE_START = (uword_t)addr;
+      lisp_linkage_table = (void*)((char*)addr + ALIEN_LINKAGE_TABLE_SPACE_SIZE);
+      addr += extra_request;
+    }
     return addr;
 }
 
@@ -700,8 +706,12 @@ static os_vm_address_t reserve_space(int space_id, int attr,
  * startup to avoid wasting time on all actions performed prior to re-exec.
  */
 
+lispobj* lisp_linkage_table;
+int lisp_linkage_table_n_entries;
+
 static void
 process_directory(int count, struct ndir_entry *entry,
+                  sword_t linkage_table_data_page,
                   int fd, os_vm_offset_t file_offset,
                   int __attribute__((unused)) merge_core_pages,
                   struct heap_adjust __attribute__((unused)) *adj)
@@ -729,7 +739,7 @@ process_directory(int count, struct ndir_entry *entry,
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         {FIXEDOBJ_SPACE_SIZE | 1, 0,
             FIXEDOBJ_SPACE_START, &fixedobj_free_pointer},
-        {1, 0, TEXT_SPACE_START, &text_space_highwatermark}
+        {TEXT_SPACE_SIZE, 0, TEXT_SPACE_START, &text_space_highwatermark}
 #endif
     };
 
@@ -836,13 +846,11 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
             case IMMOBILE_FIXEDOBJ_CORE_SPACE_ID:
+                if (addr + request > 0x80000000) lose("Won't map immobile space above 2GB");
+                 FIXEDOBJ_SPACE_START = addr;
+                 break;
             case IMMOBILE_TEXT_CORE_SPACE_ID:
-                if (addr + request > 0x80000000)
-                    lose("Won't map immobile space above 2GB");
-                if (id == IMMOBILE_FIXEDOBJ_CORE_SPACE_ID)
-                    FIXEDOBJ_SPACE_START = addr;
-                else
-                    TEXT_SPACE_START = addr;
+                TEXT_SPACE_START = addr;
                 break;
 #endif
             case DYNAMIC_CORE_SPACE_ID:
@@ -904,6 +912,12 @@ process_directory(int count, struct ndir_entry *entry,
         }
     }
 
+    if (lisp_linkage_table_n_entries)
+        load_core_bytes(fd, file_offset+
+                        (1 + linkage_table_data_page) * os_vm_page_size,
+                        (char*)lisp_linkage_table,
+                        ALIGN_UP(lisp_linkage_table_n_entries*N_WORD_BYTES, os_vm_page_size),
+                        0);
     calc_asm_routine_bounds();
 #ifndef LISP_FEATURE_DARWIN_JIT
     set_adjustment(adj, READ_ONLY_SPACE_START, // actual
@@ -970,6 +984,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
     lispobj initial_function = NIL;
     struct heap_adjust adj;
     memset(&adj, 0, sizeof adj);
+    sword_t linkage_table_data_page = -1;
 
     if (fd < 0) {
         fprintf(stderr, "could not open file \"%s\"\n", file);
@@ -1007,8 +1022,13 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
             break;
         case DIRECTORY_CORE_ENTRY_TYPE_CODE:
             process_directory(remaining_len / NDIR_ENTRY_LENGTH,
-                              (struct ndir_entry*)ptr, fd, file_offset,
-                              merge_core_pages, &adj);
+                              (struct ndir_entry*)ptr,
+                              linkage_table_data_page,
+                              fd, file_offset, merge_core_pages, &adj);
+            break;
+        case LISP_LINKAGE_TABLE_CORE_ENTRY_TYPE_CODE:
+            lisp_linkage_table_n_entries = ptr[0];
+            linkage_table_data_page = ptr[1];
             break;
         case PAGE_TABLE_CORE_ENTRY_TYPE_CODE:
             // elements = gencgc-card-table-index-nbits, n-ptes, nbytes, data-page
@@ -1017,6 +1037,8 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
             break;
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
             initial_function = adjust_word(&adj, (lispobj)*ptr);
+            SYMBOL(LINKAGE_TABLE)->value = (lispobj)lisp_linkage_table;
+            fprintf(stderr, "initfun=%lx\n",initial_function);
             break;
         case END_CORE_ENTRY_TYPE_CODE:
             free(header);

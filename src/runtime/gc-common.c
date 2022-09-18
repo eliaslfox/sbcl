@@ -810,20 +810,45 @@ static lispobj trans_boxed(lispobj object) {
                           boxed_region, PAGE_TYPE_BOXED);
 }
 static lispobj trans_tiny_mixed(lispobj object) {
-    return gc_copy_object(object, 1 + TINY_BOXED_NWORDS(*native_pointer(object)),
-                          small_mixed_region, PAGE_TYPE_SMALL_MIXED);
+    int size = 1 + TINY_BOXED_NWORDS(*native_pointer(object));
+    /*if (widetag_of(native_pointer(object)) == SYMBOL_WIDETAG)
+        return gc_copy_object(object, size, symbol_region, PAGE_TYPE_SYMBOL);
+    else*/
+        return gc_copy_object(object, size, small_mixed_region, PAGE_TYPE_SMALL_MIXED);
 }
 
-static sword_t scav_symbol(lispobj *where, lispobj header) {
+static void process_fname_fun_slot(lispobj* slot)
+{
+    lispobj fun = *slot;
+    // Process the function linker table entry
+    int index = extract_fname_index(fun);
+    if (index) {
+        lispobj entrypoint = lisp_linkage_table[index];
+        lispobj taggedptr = entrypoint_taggedptr(entrypoint);
+        lispobj new = taggedptr;
+        scav1(&new, new);
+        /* fprintf(stderr, "process_fname_fun(%d) ep=%lx tagged=%lx scav'ed=%lx tag_diff=%d\n", index,
+           entrypoint, taggedptr, new, (int)(entrypoint - taggedptr)); */
+        if (new != taggedptr) lisp_linkage_table[index] = new + (entrypoint - taggedptr);
+    }
+    // Extract the tagged pointer
+    fun = decode_fname_taggedfun(fun);
+    lispobj new = fun;
+    scav1(&new, new);
+    if (new != fun) encode_fname_fun(new, slot);
+}
+
+static sword_t scav_symbol(lispobj *where, __attribute__((unused)) lispobj header) {
 #ifdef LISP_FEATURE_COMPACT_SYMBOL
     struct symbol* s = (void*)where;
-    scavenge(&s->value, 3); // value, function, info
+    if (is_lisp_pointer(s->value)) scav1(&s->value, s->value);
+    process_fname_fun_slot(&s->func);
+    scav1(&s->info, s->info);
     lispobj name = decode_symbol_name(s->name);
     lispobj new = name;
-    scavenge(&new, 1);
+    scav1(&new, new);
     if (new != name) set_symbol_name(s, new);
-    int indicated_nwords = (header>>N_WIDETAG_BITS) & 0xFF;
-    return 1 + (indicated_nwords|1); // round to odd, then add 1 for the header
+    return ALIGN_UP(SYMBOL_SIZE, 2);
 #else
     return scav_tiny_boxed(where, header);
 #endif
@@ -1014,17 +1039,20 @@ static sword_t
 scav_fdefn(lispobj *where, lispobj __attribute__((unused)) object)
 {
     struct fdefn *fdefn = (struct fdefn *)where;
-    scavenge(where + 1, 2); // 'name' and 'fun'
+    scav1(&fdefn->name, fdefn->name);
+    process_fname_fun_slot(&fdefn->fun);
+#ifdef LISP_FEATURE_LINKER_SPACE
+    gc_assert(!fdefn->name || listp(fdefn->name));
+#else
     lispobj obj = decode_fdefn_rawfun(fdefn);
     lispobj new = obj;
-    scavenge(&new, 1);
+    scav1(&new, new);
     if (new != obj) fdefn->raw_addr += (sword_t)(new - obj);
-    // Payload length is not computed from the header
-    return FDEFN_SIZE;
+#endif
+    return FDEFN_SIZE; // Payload length is not computed from the header
 }
 static lispobj trans_fdefn(lispobj object) {
-    return gc_copy_object(object, FDEFN_SIZE,
-                          small_mixed_region, PAGE_TYPE_SMALL_MIXED);
+    return gc_copy_object(object, FDEFN_SIZE, small_mixed_region, PAGE_TYPE_SMALL_MIXED);
 }
 static sword_t size_fdefn(lispobj __attribute__((unused)) *where) {
     return FDEFN_SIZE;

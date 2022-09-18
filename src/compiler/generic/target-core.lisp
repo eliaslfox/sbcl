@@ -26,6 +26,128 @@
 (defun sb-vm::statically-link-code-obj (code fixups)
   (declare (ignore code fixups))))
 
+(define-load-time-global *fname-lock* (sb-thread:make-mutex :name "linker lock"))
+(define-symbol-macro *next-fname-index* (extern-alien "lisp_linkage_table_n_entries" int))
+(define-symbol-macro *fname-table*
+  (extern-alien "lisp_linkage_table" system-area-pointer))
+(defun fname-table-ref (index)
+  (sap-ref-sap *fname-table* (ash index sb-vm:word-shift)))
+
+;;; Assign THING in the fname linker table at specifed INDEX.
+(defun set-fname-linker-entry (index thing)
+  (with-pinned-objects (thing)
+    (let ((ep (sap+ (int-sap (get-lisp-obj-address thing))
+                    (etypecase thing
+                      (code-component
+                       (- (ash 4 sb-vm:word-shift) sb-vm:other-pointer-lowtag))
+                      (function
+                       ;; Should probably read the fun-self word?
+                       (- (ash 2 sb-vm:word-shift) sb-vm:fun-pointer-lowtag))))))
+        ;; It's essential to give the linker entry a valid value
+        ;; before publishing that the fname has that index.
+        ;; Consider the reverse order: someone reads the index, deems it good,
+        ;; emits an instruction to call it, invokes that instruction, jumps
+        ;; to 0, all before this thread has stored into the table.
+        (setf (sap-ref-sap *fname-table* (ash index sb-vm:word-shift)) ep)))
+  (sb-thread:barrier (:write)))
+
+(defun thing-entry-point (thing)
+  (sap-int (sap+ (int-sap (get-lisp-obj-address thing))
+                 (etypecase thing
+                   (code-component
+                    (- (ash 4 sb-vm:word-shift) sb-vm:other-pointer-lowtag))
+                   (function
+                    ;; Should probably read the fun-self word?
+                    (- (ash 2 sb-vm:word-shift) sb-vm:fun-pointer-lowtag))))))
+
+(defun fname-linker-entry-adddress (index)
+  (sap+ *fname-table* (ash index sb-vm:word-shift)))
+
+(defun ensure-fname-index (name)
+  (declare (type (or symbol fdefn) name))
+  ;; NAME is either a symbol or an fdefn
+  ;; Preserve the FUNCTION part of the function field
+  ;; FIXME: compare-and-swap etc
+  (with-pinned-objects (name)
+    (let* ((slot-offset
+            (etypecase name
+              (symbol (- (ash sb-vm:symbol-func-slot sb-vm:word-shift)
+                         sb-vm:other-pointer-lowtag))
+              (fdefn (- (ash sb-vm:fdefn-fun-slot sb-vm:word-shift)
+                        sb-vm:other-pointer-lowtag))))
+           (bits (sap-ref-word (int-sap (get-lisp-obj-address name)) slot-offset))
+           (index (ash bits (- sb-vm::symbol-function-bits)))
+           (current-definition
+            ;; FIXME: unsafe
+            (%make-lisp-obj (ldb (byte sb-vm::symbol-function-bits 0) bits))))
+      (unless (zerop index)
+        (return-from ensure-fname-index index))
+
+      ;; outside of acquiring any locks on the fname table,
+      ;; make a closure-calling trampoline now if needed, including for
+      ;; macro or special-operator even though "defined".
+      (let ((tramp-or-fun
+             (cond ((null current-definition) (error "can't happen"))
+                   ((eql current-definition 0) (make-trampoline name))
+                   ((closurep current-definition) (make-trampoline current-definition))
+                   (t current-definition))))
+        ;; Choose the table index
+        (setq index *next-fname-index*
+              *next-fname-index* (1+ index))
+        (set-fname-linker-entry index tramp-or-fun))
+
+      ;; Now that the fname linker table contains a directly callable
+      ;; entry point it is safe to assign the table index into the symbol.
+      (setf (sap-ref-word (int-sap (get-lisp-obj-address name)) slot-offset)
+            (logior (ash index sb-vm::symbol-function-bits)
+                    (get-lisp-obj-address current-definition)))
+      index)))
+
+;;; All these needs to synchronize. Just use the *linker-lock*.
+;; FIXME: need gc store barrier.
+;; Kludging it with %make-lisp-obj seems to work for now.
+(defun set-fname-function (name function)
+  ;; NAME is either a symbol or an fdefn
+  ;; Preserve the linker-index part of the function field
+  ;; And install a trampoline if we need it.
+  ;; FIXME: compare-and-swap etc
+  (declare (type (or function (eql 0)) function))
+
+  (with-pinned-objects (name function)
+    (let* ((slot-offset
+            (etypecase name
+              (symbol (- (ash sb-vm:symbol-func-slot sb-vm:word-shift) sb-vm:other-pointer-lowtag))
+              (fdefn  (- (ash sb-vm:fdefn-fun-slot sb-vm:word-shift) sb-vm:other-pointer-lowtag))))
+           (old (sap-ref-word (int-sap (get-lisp-obj-address name)) slot-offset))
+           (index (ash old (- sb-vm::symbol-function-bits)))
+           (new (dpb (get-lisp-obj-address function) (byte sb-vm::symbol-function-bits 0) old))
+           (tramp-or-fun (cond ((eql function 0) (make-trampoline name))
+                               ((closurep function) (make-trampoline function))
+                               (t function))))
+
+      (when (plusp index)
+        (set-fname-linker-entry index tramp-or-fun))
+
+      (typecase name
+        (symbol (%primitive sb-vm::set-slot name (%make-lisp-obj new) '(setf symbol-function)
+                            sb-vm:symbol-func-slot sb-vm:other-pointer-lowtag))
+        (fdefn
+         (%primitive sb-vm::set-direct-callable-fdefn-fun name function
+                     (thing-entry-point tramp-or-fun))
+         (%primitive sb-vm::set-slot name (%make-lisp-obj new) '(setf fdefinition)
+                     sb-vm:fdefn-fun-slot sb-vm:other-pointer-lowtag)
+         ))))
+  function)
+
+(defun fname-linker-index (name)
+  (ash (get-lisp-obj-address
+        (etypecase name
+          (symbol (%primitive sb-vm::slot name 'symbol-function
+                              sb-vm:symbol-func-slot sb-vm:other-pointer-lowtag))
+          (fdefn  (%primitive sb-vm::slot name 'sb-vm::fdefn-fun
+                              sb-vm:fdefn-fun-slot sb-vm:other-pointer-lowtag))))
+       (- sb-vm::symbol-function-bits)))
+
 #+immobile-code
 (progn
   ;; Use FDEFINITION because it strips encapsulations - whether that's
@@ -47,7 +169,12 @@
   ;; which is either an fdefn or the name of an fdefn.
   ;; FIXME: Shouldn't this go in x86-64-vm ?
   (defun sb-vm::fdefn-entry-address (fdefn)
+    ;;;(declare (type (or symbol list fdefn) fdefn))
+    (when (fdefn-p fdefn) (break "That was unexpected"))
+    ;;(format t "~&fdefn-entry-address ~s~%" fdefn)
     (let ((fdefn (if (fdefn-p fdefn) fdefn (find-or-create-fdefn fdefn))))
+      (let ((name (fdefn-name fdefn)))
+        (ensure-fname-index (if (symbolp name) name fdefn)))
       (+ (get-lisp-obj-address fdefn)
          (- 2 sb-vm:other-pointer-lowtag)))))
 
@@ -85,6 +212,13 @@
                    ((:assembly-routine :assembly-routine*)
                     (or (get-asm-routine name (eq flavor :assembly-routine*))
                         (error "undefined assembler routine: ~S" name)))
+                   (:lisp-linkage-index
+                    (ash (ensure-fname-index (if (symbolp name) name (find-or-create-fdefn name)))
+                         sb-vm:word-shift))
+                   (:lisp-linkage-cell
+                    (let ((index (ensure-fname-index
+                                  (if (symbolp name) name (find-or-create-fdefn name)))))
+                      (sap-int (sap+ *fname-table* (ash index sb-vm:word-shift)))))
                    (:alien-code-linkage-index (sb-impl::ensure-alien-linkage-index name nil))
                    (:alien-data-linkage-index (sb-impl::ensure-alien-linkage-index name t))
                    (:foreign (foreign-symbol-address name))
@@ -100,11 +234,6 @@
                    ;; value is known to be an immobile object
                    ;; (whose address we don't want to wire in).
                    (:symbol-value (get-lisp-obj-address (symbol-global-value name)))
-                   #+immobile-code
-                   (:fdefn-call
-                    (prog1 (sb-vm::fdefn-entry-address name) ; creates if didn't exist
-                      (when statically-link-p
-                        (push (cons offset (find-fdefn name)) (elt preserved-lists 0)))))
                    #+immobile-code (:static-call (sb-vm::function-raw-address name)))
                  kind flavor))
 
@@ -230,7 +359,7 @@
   ;; Serial# shares a word with the jump-table word count,
   ;; so we can't assign serial# until after all raw bytes are copied in.
   ;; Do we need unique IDs on the various strange kind of code blobs? These would
-  ;; include code from MAKE-SIMPLIFYING-TRAMPOLINE, ENCAPSULATE-FUNOBJ, MAKE-BPT-LRA.
+  ;; include code from MAKE-TRAMPOLINE, ENCAPSULATE-FUNOBJ, MAKE-BPT-LRA.
   (let* ((serialno (ldb (byte (byte-size sb-vm::code-serialno-byte) 0)
                         (atomic-incf *code-serialno*)))
          (insts (code-instructions code-obj))
@@ -279,6 +408,11 @@
     (sb-vm::jit-copy-code-constants (get-lisp-obj-address code)
                                     (get-lisp-obj-address data))))
 
+(defun find-or-create-fname (name)
+  #+linker-space (if (symbolp name) name (find-or-create-fdefn name))
+  #-linker-space (find-or-create-fdefn name))
+(defun find-or-create-fdefn* (name) (find-or-create-fname name))
+
 (defun make-core-component (component segment length fixup-notes alloc-points object)
   (declare (type component component)
            (type segment segment)
@@ -308,7 +442,7 @@
             (let ((const (aref constants index)))
               (when (typep const '(cons (eql :fdefinition)))
                 (incf count)
-                (setf (second const) (find-or-create-fdefn (second const)))))))
+                (setf (second const) (find-or-create-fname (second const)))))))
          (retained-fixups (pack-retained-fixups fixup-notes))
          ((code-obj total-nwords)
           (allocate-code-object (component-mem-space component)
