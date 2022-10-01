@@ -46,10 +46,10 @@
 
 (defun sb-vm::collect-immobile-code-relocs ()
   (let ((code-components
-         (make-array 20000 :element-type '(unsigned-byte 32)
+         (make-array 20000 :element-type 'sb-vm:word
                            :fill-pointer 0 :adjustable t))
         (relocs
-         (make-array 100000 :element-type '(unsigned-byte 32)
+         (make-array 100000 :element-type 'sb-vm:word
                             :fill-pointer 0 :adjustable t))
         (seg (sb-disassem::%make-segment
               :sap-maker (lambda () (error "Bad sap maker")) :virtual-location 0))
@@ -121,6 +121,8 @@
 (defun rip-relative-p (modrm-byte) (= (logand modrm-byte #b11000111) #b00000101))
 
 (defun sb-vm::statically-link-core (&key callers)
+  callers
+  #+nil
   (do-immobile-code (code)
     (when (or (not callers)
               (and (plusp (code-n-entries code))
@@ -195,9 +197,16 @@
 ;;; The only way to detect the current set of references is to find uses of the
 ;;; current jump address, which means we need to fix them *all* before anyone
 ;;; else gets an opportunity to change the fdefn-fun of this same fdefn again.
+(defun fdefn-raw-addr (fdefn)
+  (break "fdefn-raw-addr ~S" fdefn)
+  #+nil
+  (let* ((index (sb-c::fname-linker-index fdefn))
+         (answer (sb-c::fname-table-ref index)))
+    (format t "~&fdefn-raw-addr ~S -> ~S -> ~S~%" fdefn index answer)
+    answer))
 (defun sb-vm::remove-static-links (fdefn)
   (sb-int:with-system-mutex (sb-vm::*static-linker-lock*)
-    (let ((fun-entry (sb-vm::fdefn-raw-addr fdefn))
+    (let ((fun-entry (fdefn-raw-addr fdefn))
           (fdefn-entry (sb-vm::fdefn-entry-address fdefn)))
       (flet ((code-statically-links-fdefn-p (code)
                (multiple-value-bind (fdefns-start count) (sb-vm::code-header-fdefn-range code)

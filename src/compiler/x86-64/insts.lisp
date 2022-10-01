@@ -3366,7 +3366,7 @@
             #+immobile-space
             ((and (eq (fixup-note-kind note) :abs32)
                   (memq flavor
-                        '(:fdefn-call :layout :immobile-symbol :symbol-value ; -> fixedobj space
+                        '(:layout :immobile-symbol :symbol-value ; -> fixedobj space
                           :static-call))) ; -> text space
              (push offset abs32-fixups))))))
 

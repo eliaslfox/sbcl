@@ -109,10 +109,14 @@ distinct from the global value. Can also be SETF."
 ;;; Don't strip encapsulations.
 (declaim (inline %symbol-function))
 (defun %symbol-function (symbol)
-  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
-    (if (eql fdefn 0) nil (fdefn-fun (truly-the fdefn fdefn)))))
-(defun (setf %symbol-function) (newval symbol) ; OK to use only if fdefn exists
-  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
+  #+linker-space (let ((fun (%primitive sb-vm::fast-symbol-function symbol)))
+                    (if (eql fun 0) nil fun))
+  #-linker-space (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
+                    (if (eql fdefn 0) nil (fdefn-fun (truly-the fdefn fdefn)))))
+(defun (setf %symbol-function) (newval symbol)
+  #+linker-space (set-fname-function symbol newval)
+  #-linker-space
+  (let ((fdefn (sb-vm::%symbol-fdefn symbol))) ; OK to use only if fdefn exists
     (setf (fdefn-fun (truly-the fdefn fdefn)) newval)))
 
 (defun symbol-function (symbol)
@@ -144,8 +148,8 @@ distinct from the global value. Can also be SETF."
     ;; e.g. what's up with *USER-HASH-TABLE-TESTS* being checked
     ;; in %SET-FDEFINITION but not here?
     (maybe-clobber-ftype symbol new-value)
-    (let ((fdefn (find-or-create-fdefn symbol)))
-      (setf (fdefn-fun fdefn) new-value))))
+    #-linker-space (setf (fdefn-fun (find-or-create-fdefn symbol)) new-value)
+    #+linker-space (setf (%symbol-function symbol) new-value)))
 
 ;;; Incredibly bogus kludge: the :CAS-TRANS option in objdef makes no indication
 ;;; that you can not use it on certain platforms, so then you do try to use it,

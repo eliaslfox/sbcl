@@ -788,11 +788,8 @@
 
                           (move rbp-tn new-fp))))  ; NB - now on new stack frame.
 
-               (when (and step-instrumenting
-                          ,@(and (eq named :direct)
-                                 `((not (and #+immobile-code
-                                             ;; handle-single-step-around-trap can't handle it
-                                             (static-fdefn-offset fun))))))
+               (when step-instrumenting
+                 ,@(when (eq named :direct) '((compute-linkage-cell node fun)))
                  (emit-single-step-test)
                  (inst jmp :eq DONE)
                  (inst break single-step-around-trap))
@@ -838,28 +835,31 @@
   (define-full-call fixed-call-named t :fixed nil :fixed)
   (define-full-call fixed-tail-call-named t :tail nil :fixed))
 
+(defun compute-linkage-cell (node name)
+  (cond ((sb-c::code-immobile-p node)
+         (inst lea rax-tn (rip-relative-ea (make-fixup name :lisp-linkage-cell))))
+        (t
+         (inst mov rax-tn #+sb-thread (thread-slot-ea sb-vm::thread-lisp-linkage-table-base-slot)
+                          #-sb-thread (static-symbol-value-ea '*linkage-table*))
+         (inst lea rax-tn (ea (make-fixup name :lisp-linkage-index) rax-tn)))))
+
 ;;; Call NAME "directly" meaning in a single JMP or CALL instruction,
 ;;; if possible (without loading RAX)
 (defun emit-direct-call (name instruction node step-instrumenting)
-      ;; a :STATIC-CALL fixup is the address of the entry point of
-      ;; the function itself, and a :FDEFN-CALL fixup is the address
-      ;; of the JMP instruction embedded in the header for the named FDEFN.
-  (let* ((fixup (make-fixup name
-                 (if (static-fdefn-offset name) :static-call :fdefn-call)))
-         (target
-              (if (and (sb-c::code-immobile-p node)
-                       (not step-instrumenting))
-                  fixup
-                  (progn
-                    ;; RAX-TN was not declared as a temp var,
-                    ;; however it's sole purpose at this point is
-                    ;; for function call, so even if it was used
-                    ;; to compute a stack argument, it's free now.
-                    ;; If the call hits the undefined fun trap,
-                    ;; RAX will get loaded regardless.
-                    (inst mov rax-tn fixup)
-                    rax-tn))))
-    (inst* instruction target)))
+  (cond (step-instrumenting
+         ;; If step-instrumenting, then RAX points to the linkage table cell
+         (inst* instruction (ea rax-tn)))
+        ((sb-c::code-immobile-p node)
+         ;; a :STATIC-CALL fixup is the address of the entry point of
+         ;; the function itself, usable only if caller is immobile.
+         (inst* instruction (if (static-fdefn-offset name)
+                                (make-fixup name :static-call)
+                                (rip-relative-ea (make-fixup name :lisp-linkage-cell)))))
+        (t
+         ;; get the linkage table into RAX
+         (inst mov rax-tn #+sb-thread (thread-slot-ea sb-vm::thread-lisp-linkage-table-base-slot)
+                          #-sb-thread (static-symbol-value-ea '*linkage-table*))
+         (inst* instruction (ea (make-fixup name :lisp-linkage-index) rax-tn)))))
 
 ;;; Invoke the function-designator FUN.
 (defun tail-call-unnamed (fun type vop)

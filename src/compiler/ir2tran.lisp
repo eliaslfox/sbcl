@@ -161,6 +161,12 @@
                    #-sb-xc-host (if (producing-fasl-file) t (fboundp name)))
               (emit-move node block (make-load-time-constant-tn :known-fun name)
                          res))
+             #+linker-space
+             ((symbolp name)
+              (let ((symbol-tn (make-load-time-constant-tn :fdefinition name)))
+                (if unsafe
+                    (vop sb-vm::fast-symbol-function node block symbol-tn res)
+                    (vop sb-vm::safe-symbol-function node block symbol-tn res))))
              (t
               (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
                 #+untagged-fdefns

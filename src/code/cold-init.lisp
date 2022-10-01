@@ -131,6 +131,7 @@
                       object hash (sxhash object)))))
 
 ;;; called when a cold system starts up
+(defvar *initial-undefs*)
 (defun !cold-init ()
   "Give the world a shove and hope it spins."
 
@@ -138,6 +139,7 @@
   #+sb-show (setq */show* t)
   (setq sb-vm::*immobile-codeblob-tree* nil
         sb-vm::*dynspace-codeblob-tree* nil)
+  (setq sb-impl::*fname-table-lock* (sb-thread:make-mutex :name "linker mutex"))
   (setq sb-kernel::*defstruct-hooks* '(sb-kernel::!bootstrap-defstruct-hook)
         sb-kernel::*struct-accesss-fragments-delayed* nil)
   (let ((stream (!make-cold-stderr-stream)))
@@ -174,8 +176,15 @@
   (sb-thread::init-main-thread)
 
   ;; not sure why this is needed on some architectures. Dark magic.
+  #-linker-space
   (setf (fdefn-fun (find-or-create-fdefn '%coerce-callable-for-call))
         #'%coerce-callable-to-fun)
+  (show-and-call !loader-cold-init)
+  #+linker-space
+  (dovector (fname (the simple-vector *initial-undefs*))
+;    (format t "~&GERBI ~S~%" fname)
+    (set-fname-function fname 0))
+
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
   ;; It was fine if T because in that case the legality of the arg is certain.
   ;; And be extra paranoid - ensure that it really gets called.
@@ -210,7 +219,6 @@
   (show-and-call !type-cold-init)
   (show-and-call !policy-cold-init-or-resanify)
   (/show0 "back from !POLICY-COLD-INIT-OR-RESANIFY")
-  (show-and-call !loader-cold-init)
   #+x86-64 (sb-fasl::validate-asm-routine-vector)
 
   ;; Must be done before toplevel forms are invoked

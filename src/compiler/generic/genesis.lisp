@@ -693,7 +693,6 @@
 
 ;;; a handle on the NIL object
 (defvar *nil-descriptor*)
-(defvar *c-callable-fdefn-vector*)
 
 ;;; the head of a list of TOPLEVEL-THINGs describing stuff to be done
 ;;; when the target Lisp starts up
@@ -1193,8 +1192,21 @@ core and return a descriptor to it."
     (if (= (descriptor-bits val) sb-vm:unbound-marker-widetag)
         (error "Symbol value of ~a is unbound." symbol)
         val)))
+
+#+linker-space
+(progn
+  (defvar *fname-table* (make-array 100 :fill-pointer 1 :adjustable t :initial-element 0))
+  (defconstant-eqx fname-index-bytespec
+      (byte (- sb-vm:n-word-bits sb-vm::symbol-function-bits)
+            sb-vm::symbol-function-bits)
+    #'equalp)
+  (defconstant-eqx fname-function-bytespec (byte sb-vm::symbol-function-bits 0) #'equalp))
+
 (defun cold-fdefn-fun (cold-fdefn)
-  (read-wordindexed cold-fdefn sb-vm:fdefn-fun-slot))
+  #+linker-space (let* ((bits (read-bits-wordindexed cold-fdefn sb-vm:fdefn-fun-slot))
+                         (masked (ldb fname-function-bytespec bits)))
+                    (if (zerop masked) *nil-descriptor* (make-random-descriptor masked)))
+  #-linker-space (read-wordindexed cold-fdefn sb-vm:fdefn-fun-slot))
 
 
 ;;;; layouts and type system pre-initialization
@@ -1679,8 +1691,12 @@ core and return a descriptor to it."
   (let* ((symbol (if (symbolp symbol)
                      symbol
                      (warm-symbol symbol)))
-         (f (cold-fdefn-fun (ensure-cold-fdefn symbol))))
-    (cond ((not (cold-null f)) f)
+         (f #+linker-space
+            (make-random-descriptor
+             (ldb fname-function-bytespec
+                  (read-bits-wordindexed (cold-intern symbol) sb-vm:symbol-func-slot)))
+            #-linker-space (cold-fdefn-fun (ensure-cold-fdefn symbol))))
+    (cond ((and (not (cold-null f)) (/= (descriptor-bits f) 0)) f)
           (errorp (error "Expected a definition for ~S in cold load" symbol))
           (t nil))))
 
@@ -1886,24 +1902,13 @@ core and return a descriptor to it."
               (emplace-vector vector sb-vm:simple-vector-widetag 256)
               vector))
 
-  ;; Immobile code prefers all FDEFNs adjacent so that code can be located
-  ;; anywhere in the addressable memory allowed by the OS, as long as all
-  ;; FDEFNs are near enough all code (i.e. within a 32-bit jmp offset).
-  ;; That fails if static fdefns are wired to an address below 4GB
-  ;; and code resides above 4GB. But as the Fundamental Theorem says:
-  ;;   any problem can be solved by adding another indirection.
-  #+immobile-code
-  (progn
-  (setf *c-callable-fdefn-vector*
-        (vector-in-core (make-list (length sb-vm::+c-callable-fdefns+)
-                                   :initial-element *nil-descriptor*)
-                        *static*))
+  #+immobile-space
   (setf *asm-routine-vector* (word-vector (make-list 70 :initial-element 0)
-                                          *static*)))
+                                          *static*))
 
-  #-immobile-code
   (dolist (sym sb-vm::+c-callable-fdefns+)
-    (ensure-cold-fdefn sym *static*))
+    #+immobile-code (ensure-fname-index sym)
+    #-immobile-code (ensure-cold-fdefn sym *static*))
 
   ;; With immobile-code, static-fdefns as a concept are useful -
   ;; the implication is that the function's definition will not change.
@@ -1966,16 +1971,29 @@ core and return a descriptor to it."
 
   (cold-set 'sb-impl::*setf-fdefinition-hook* *nil-descriptor*)
   (cold-set 'sb-impl::*user-hash-table-tests* *nil-descriptor*)
+  #+linker-space
+  (let (undefineds)
+    ;; Scan all symbols and note which ones have a linkage index but are undefined.
+    ;; They will need to have an undefined trampoline installed ASAP.
+    (maphash (lambda (bits symbol &aux (index (cold-fname-linker-index symbol))
+                                       (fun (cold-symbol-function symbol nil)))
+               (when (and (plusp index) (null fun))
+                 (push (make-random-descriptor bits) undefineds)))
+             *cold-symbols*)
+    ;; Similarly, scan fdefns 
+    (maphash (lambda (name fdefn &aux (index (cold-fname-linker-index name))
+                                      (fun (cold-fdefn-fun fdefn)))
+               (when (and (plusp index) (cold-null fun))
+                 (push fdefn undefineds)))
+             *cold-fdefn-objects*)
+    (cold-set 'sb-impl::*initial-undefs*
+              (vector-in-core (sort undefineds #'< :key #'descriptor-bits))))
 
-  ;; Put the C-callable fdefns into the static-fdefn vector if #+immobile-code.
   #+immobile-code
   (let* ((space *immobile-text*)
          (wordindex (gspace-free-word-index space))
          (words-per-page (/ sb-vm:immobile-card-bytes sb-vm:n-word-bytes)))
     (cold-set 'sb-fasl::*asm-routine-vector* *asm-routine-vector*)
-    (loop for i from 0 for sym in sb-vm::+c-callable-fdefns+
-          do (cold-svset *c-callable-fdefn-vector* i
-                         (ensure-cold-fdefn sym)))
     (let* ((objects (gspace-objects space))
            (count (length objects)))
       (let ((remainder (rem wordindex words-per-page)))
@@ -2140,23 +2158,24 @@ core and return a descriptor to it."
 ;;; the static fdefns are initialized.
 (defvar *deferred-undefined-tramp-refs*)
 (defun fdefn-makunbound (fdefn)
-  (write-wordindexed fdefn sb-vm:fdefn-fun-slot *nil-descriptor*)
-  (write-wordindexed/raw fdefn sb-vm:fdefn-raw-addr-slot
-                         (lookup-assembler-reference 'sb-vm::undefined-tramp :direct)))
-(defun ensure-cold-fdefn (cold-name &optional
-                                          (gspace #+immobile-space *immobile-fixedobj*
-                                                  #-immobile-space *dynamic*))
+  (declare (ignorable fdefn))
+  #-linker-space ; The slot default of 0 is correct if #+linker-space
+  (progn
+    (write-wordindexed fdefn sb-vm:fdefn-fun-slot *nil-descriptor*)
+    (write-wordindexed/raw fdefn sb-vm:fdefn-raw-addr-slot
+                           (lookup-assembler-reference 'sb-vm::undefined-tramp :direct))))
+(defun ensure-cold-fdefn (cold-name &optional (gspace  *dynamic*))
   (declare (type (or symbol descriptor) cold-name))
   (let ((warm-name (warm-fun-name cold-name)))
     (or (gethash warm-name *cold-fdefn-objects*)
         (let ((fdefn (allocate-otherptr gspace sb-vm:fdefn-size sb-vm:fdefn-widetag)))
           (setf (gethash warm-name *cold-fdefn-objects*) fdefn)
-          #+x86-64
-          (write-wordindexed/raw ; write an INT instruction into the header
-           fdefn 0 (logior (ash sb-vm::undefined-fdefn-header 16)
-                           (read-bits-wordindexed fdefn 0)))
-          (write-wordindexed fdefn sb-vm:fdefn-name-slot cold-name)
+          #+compact-fdefn (write-wordindexed/raw ; stuff NAME into the header
+                          fdefn 0 (logior (ash (descriptor-bits cold-name) 16)
+                                          (read-bits-wordindexed fdefn 0)))
+          #-compact-fdefn (write-wordindexed fdefn sb-vm:fdefn-name-slot cold-name)
           (when core-file-name
+            #-linker-space
             (when (typep warm-name '(and symbol (not null)))
               (write-wordindexed (cold-intern warm-name) sb-vm:symbol-fdefn-slot fdefn))
             (if *cold-assembler-obj*
@@ -2178,11 +2197,10 @@ core and return a descriptor to it."
 (defun cold-fset (name function)
   (aver (= (logand (read-bits-wordindexed function 0) sb-vm:widetag-mask)
            sb-vm:simple-fun-widetag))
+  #-linker-space
   (let ((fdefn (ensure-cold-fdefn
                 ;; (SETF f) was descriptorized when dumped, symbols were not.
-                (if (symbolp name)
-                    (cold-intern name)
-                    name))))
+                (if (symbolp name) (cold-intern name) name))))
     (let ((existing (read-wordindexed fdefn sb-vm:fdefn-fun-slot)))
       (unless (or (cold-null existing) (descriptor= existing function))
         (error "Function multiply defined: ~S. Was ~x is ~x" name
@@ -2199,7 +2217,18 @@ core and return a descriptor to it."
          ;; For all others raw addr is the starting address
          (+ (logandc2 (descriptor-bits function) sb-vm:lowtag-mask)
             (ash sb-vm:simple-fun-insts-offset sb-vm:word-shift))))
-    fdefn))
+    fdefn)
+  #+linker-space
+  (let* ((cold-fname ;; (SETF f) was descriptorized when dumped, symbols were not.
+          (if (symbolp name) (cold-intern name) (ensure-cold-fdefn name)))
+         (fun-slot (if (symbolp name) sb-vm:symbol-func-slot sb-vm:fdefn-fun-slot))
+         (old-bits (read-bits-wordindexed cold-fname fun-slot))
+         (shifted-index (mask-field fname-index-bytespec old-bits))
+         (new-bits (logior shifted-index (descriptor-bits function))))
+    (unless (or (= (ldb fname-function-bytespec old-bits) 0) (= old-bits new-bits))
+      (error "Function multiply defined: ~S. Was ~x is ~x" name old-bits new-bits))
+    (write-wordindexed/raw cold-fname fun-slot new-bits)
+    cold-fname))
 
 (defun attach-classoid-cells-to-symbols (hashtable)
   (when (plusp (hash-table-count *classoid-cells*))
@@ -2745,7 +2774,8 @@ Legal values for OFFSET are -4, -8, -12, ..."
                            fun))))))))))
 
 (define-cold-fop (fop-fdefn)
-  (ensure-cold-fdefn (pop-stack)))
+  (let ((name (pop-stack)))
+    (if (or #+linker-space (symbolp name)) (cold-intern name) (ensure-cold-fdefn name))))
 
 (define-cold-fop (fop-known-fun)
   (let ((name (pop-stack)))
@@ -2918,6 +2948,58 @@ Legal values for OFFSET are -4, -8, -12, ..."
   (pop-stack)
   (values))
 
+#+linker-space
+(progn
+(defun ensure-fname-index (name)
+  (etypecase name
+    (symbol
+     (let* ((cold-sym (cold-intern name))
+            (bits (read-bits-wordindexed cold-sym sb-vm:symbol-func-slot))
+            (index (ldb fname-index-bytespec bits)))
+       (when (zerop index)
+         (setq index (vector-push-extend name *fname-table*))
+         (write-wordindexed/raw
+          cold-sym sb-vm:symbol-func-slot (dpb index fname-index-bytespec bits)))
+       index))
+    (descriptor
+     (let* ((cold-fdefn (ensure-cold-fdefn name))
+            (bits (read-bits-wordindexed cold-fdefn sb-vm:fdefn-fun-slot))
+            (index (ldb fname-index-bytespec bits)))
+       (when (zerop index)
+         (setq index (vector-push-extend cold-fdefn *fname-table*))
+         (write-wordindexed/raw
+          cold-fdefn sb-vm:fdefn-fun-slot (dpb index fname-index-bytespec bits)))
+       index))))
+
+(defun cold-fname-linker-index (function-name)
+  (ldb fname-index-bytespec
+       (etypecase function-name
+         (symbol
+          (read-bits-wordindexed (cold-intern function-name) sb-vm:symbol-func-slot))
+         (list
+          (read-bits-wordindexed (gethash function-name *cold-fdefn-objects*)
+                                 sb-vm:fdefn-fun-slot)))))
+
+;;; Return the address to jump to when calling the simple-fun named NAME.
+;;; This populates the fname linker space.
+(defun cold-function-entry-point (function-name)
+  (let ((bits
+         (ldb fname-function-bytespec
+              (etypecase function-name
+                (symbol
+                 (read-bits-wordindexed (cold-intern function-name) sb-vm:symbol-func-slot))
+                (descriptor
+                 (read-bits-wordindexed function-name sb-vm:fdefn-fun-slot))))))
+    (if (zerop bits)
+        0
+        (let ((widetag (logand (read-bits-wordindexed (make-random-descriptor bits) 0)
+                               sb-vm:widetag-mask)))
+          (aver (= widetag sb-vm:simple-fun-widetag))
+          (read-bits-wordindexed (make-random-descriptor bits) sb-vm:simple-fun-self-slot)))))
+
+(defun lisp-linkage-table-start () (- sb-vm:text-space-start (* 8 1024 1024)))
+)
+
 ;;; Target variant of this is defined in 'target-load'
 (defun apply-fixups (code-obj fixups index count &aux (end (1- (+ index count))))
   (let ((retained-fixups (svref fixups index)))
@@ -2943,6 +3025,10 @@ Legal values for OFFSET are -4, -8, -12, ..."
           (cold-fixup
            code-obj offset
            (ecase flavor
+             #+linker-space
+             (:lisp-linkage-cell
+              (let ((index (ensure-fname-index name)))
+                (+ (lisp-linkage-table-start) (ash index sb-vm:word-shift))))
              (:assembly-routine (lookup-assembler-reference name))
              (:assembly-routine* (lookup-assembler-reference name :indirect))
              (:foreign (alien-linkage-table-note-symbol string nil))
@@ -2960,12 +3046,7 @@ Legal values for OFFSET are -4, -8, -12, ..."
               ;; an interned symbol is represented by its host symbol,
               ;; but an uninterned symbol is a descriptor.
               (descriptor-bits (if (symbolp name) (cold-intern name) name)))
-             (:symbol-value (descriptor-bits (cold-symbol-value name)))
-             (:fdefn-call ; x86-64 only
-              (+ (descriptor-bits (ensure-cold-fdefn name))
-                 ;; this jumps to the jump instruction embedded within an fdefn.
-                 ;; (It's a terrible technique which I plan to remove.)
-                 (- 2 sb-vm:other-pointer-lowtag))))
+             (:symbol-value (descriptor-bits (cold-symbol-value name))))
            kind flavor))))
   code-obj)
 
@@ -3333,14 +3414,42 @@ Legal values for OFFSET are -4, -8, -12, ..."
   return (struct ~A*)(obj - ~D);~%}~%" c-name operator-name c-name lowtag)
   (case operator-name
     (fdefn
+     #-compact-fdefn (format stream "static inline lispobj fdefn_name(struct fdefn *f) {
+  return f->name;~%}
+static inline void set_fdefn_name(struct fdefn *f, lispobj name) { f->name = name; }~%")
+     #+compact-fdefn (format stream "static inline lispobj fdefn_name(struct fdefn *f) {
+  return f->header>>16;~%}
+static inline void set_fdefn_name(struct fdefn *f, lispobj name) {
+  f->header = name << 16 | (f->header & 0xFFFF);}")
+     #-linker-space
      (format stream "#define StaticSymbolFunction(x) FdefnFun(x##_FDEFN)
 /* Return 'fun' given a tagged pointer to an fdefn. */
-static inline lispobj FdefnFun(lispobj fdefn) { return FDEFN(fdefn)->fun; }~%"))
+static inline lispobj FdefnFun(lispobj fdefn) { return FDEFN(fdefn)->fun; }~%")
+     #+linker-space
+     (progn
+       (format stream "static inline lispobj fdefn_function(struct fdefn* f) {
+  return (f->fun << 16) >> 16;~%}
+static inline lispobj fdefn_linker_index(struct fdefn* f) {
+  return f->fun >> ~D;~%}
+#define decode_fname_taggedfun(ptr) (ptr & (uword_t)0x~X)
+static inline void encode_fname_fun(lispobj fun, lispobj* slot) {
+  *slot = (*slot & (uword_t)0x~X) | fun;~%}~%"
+            sb-vm::symbol-function-bits
+            (ldb (byte sb-vm::symbol-function-bits 0) -1)
+            (mask-field (byte (- sb-vm:n-word-bits sb-vm::symbol-function-bits)
+                              sb-vm::symbol-function-bits)
+                        -1))
+       (format stream "#define StaticSymbolFunction(x) simplefun_from_linker_index(x##_fname_index)
+/* Return 'fun' given an index to the function linker table.
+ * This is slightly nontrivial because the linker table stores raw entry
+ * addresses but the C funcallN functions expect a tagged pointer */
+static inline lispobj simplefun_from_linker_index(int index) {
+    lispobj* base = (lispobj*)(lisp_linkage_table[index] - 2*N_WORD_BYTES);
+    return widetag_of(base)==SIMPLE_FUN_WIDETAG?make_lispobj(base,FUN_POINTER_LOWTAG):0;
+}~%")))
     (symbol
-     (format stream "
-lispobj symbol_function(struct symbol* symbol);
-#include \"~A/vector.h\"
-struct vector *symbol_name(struct symbol*);~%
+     (format stream "#include \"~A/vector.h\"
+struct vector *symbol_name(struct symbol*);
 lispobj symbol_package(struct symbol*);~%" (genesis-header-prefix))
      (format stream "static inline int symbol_package_id(struct symbol* s) { return ~A; }~%"
             #+compact-symbol (format nil "s->name >> ~D" sb-impl::symbol-name-bits)
@@ -3354,7 +3463,16 @@ lispobj symbol_package(struct symbol*);~%" (genesis-header-prefix))
      #-compact-symbol
      (progn (format stream "#define decode_symbol_name(ptr) ptr~%")
             (format stream "static inline void set_symbol_name(struct symbol*s, lispobj name) {
-  s->name = name;~%}~%")))))
+  s->name = name;~%}~%"))
+     #+linker-space
+     (format stream "static inline lispobj symbol_function(struct symbol* s) {
+  return s->func & 0x~X;~%}
+static inline lispobj symbol_linker_index(struct symbol* s) {
+  return s->func >> ~D;~%}~%"
+             (mask-field  (byte sb-vm::symbol-function-bits 0) -1)
+             sb-vm::symbol-function-bits)
+     )))
+
 
 (defun mangle-c-slot-name (obj-name slot-name)
   ;; For data hiding purposes, change the name of vector->length to vector->length_.
@@ -3496,17 +3614,15 @@ lispobj symbol_package(struct symbol*);~%" (genesis-header-prefix))
           #+metaspace "READ_ONLY" #-metaspace "FIXEDOBJ"
           (- (cold-layout-descriptor-bits 'function)
                         (gspace-byte-address (symbol-value *cold-layout-gspace*))))
-  ;; For immobile code, define a constant for the address of the vector of
-  ;; C-callable fdefns, and then fdefns in terms of indices to that vector.
+
+  ;; For immobile code, define preprocessor constants for the indices
+  ;; of the C-callable functions.
   #+immobile-code
   (progn
-    (format stream "#define STATIC_FDEFNS LISPOBJ(0x~X)~%"
-            (descriptor-bits *c-callable-fdefn-vector*))
     (loop for symbol in sb-vm::+c-callable-fdefns+
-          for index from 0
-          do (format stream "#define ~A_fdefn ~d~0@*
-#define ~A_FDEFN (VECTOR(STATIC_FDEFNS)->data[~d])~%"
-                     (c-symbol-name symbol) index)))
+          do (format stream "#define ~A_fname_index ~d~%"
+                     (c-symbol-name symbol) (ensure-fname-index symbol))))
+
   ;; Everybody else can address each fdefn directly.
   #-immobile-code
   (loop for symbol in sb-vm::+c-callable-fdefns+
@@ -3561,25 +3677,13 @@ cross-compiler knew their inline definition and used that everywhere
 that they were called before the out-of-line definition is installed,
 as is fairly common for structure accessors.)")
 
-(defun write-map (*standard-output* &aux (*print-pretty* nil)
-                                         (*print-case* :upcase))
-  (format t "Table of contents~%")
-  (format t "=================~%")
-  (let ((sections '("assembler routines" "defined functions" "undefined functions"
-                    "classoids" "layouts"
-                    "packages" "symbols"
-                    "type specifiers"
-                    "linkage table" #+sb-thread "TLS map")))
-    (dotimes (i (length sections))
-      (format t "~4<~@R~>. ~A~%" (1+ i) (nth i sections))))
-  (format t "=================~2%")
+(defun linkage-index->addr (index)
+  (if (eql index 0)
+      0
+      (+ (lisp-linkage-table-start) (ash index sb-vm:word-shift))))
 
-  (format t "I. assembler routines defined in core image: (base=~x)~2%"
-          (descriptor-bits *cold-assembler-obj*))
-  (dolist (routine *cold-assembler-routines*)
-    (let ((name (car routine)))
-      (format t "~8,'0X: ~S~%" (lookup-assembler-reference name) name)))
-
+(defun write-function-map ()
+  #-linker-space
   (let ((funs nil) (undefs nil))
     (maphash (lambda (name fdefn &aux (fun (cold-fdefn-fun fdefn)))
                (let ((fdefn-bits (descriptor-bits fdefn)))
@@ -3612,6 +3716,73 @@ III. initially undefined function references (alphabetically):
                             ((string> pkg-a pkg-b) nil)
                             (t (string< a b))))
                     :key (lambda (x) (fun-name-block-name (cadr x))))))
+  #+linker-space
+  (let ((funs nil) (undefs nil))
+    ;; Scan all symbols and output all the ones with nonzero linker index
+    (maphash (lambda (bits symbol &aux (index (cold-fname-linker-index symbol))
+                                       (fun (cold-symbol-function symbol nil)))
+               (cond ((and (plusp index) (null fun))
+                      (push `(0 ,index ,symbol) undefs))
+                     (fun
+                      (push `(,index ,(linkage-index->addr index) ,bits
+                              ,(descriptor-bits fun) ,symbol)
+                            funs))))
+             *cold-symbols*)
+    (maphash (lambda (name fdefn &aux (fun (cold-fdefn-fun fdefn)))
+               (let* ((fdefn-bits (descriptor-bits fdefn))
+                      (index (cold-fname-linker-index name)))
+                 (if (cold-null fun)
+                     (push `(,fdefn-bits ,index ,name) undefs)
+                     (push `(,index ,(linkage-index->addr index) ,fdefn-bits
+                             ,(descriptor-bits fun) ,name)
+                           funs))))
+             *cold-fdefn-objects*)
+    (flet ((list-funs (list)
+             (format t "
+INDEX   LINK-ADDR       FNAME    FUNCTION  NAME
+=====  ==========  ==========  ==========  ====
+~:{~[     ~:;~:*~5x~]  ~[          ~:;~:*~10x~]  ~10,'0X  ~10,'0X  ~S~%~}~%"
+                     list)))
+      (format t "~%~|~%II.A. defined functions (alphabetically):")
+      (list-funs (sort (copy-list funs) #'string<
+                       :key (lambda (x) (fun-name-block-name (fifth x)))))
+      (format t "~%~|~%II.B. defined functions (numerically):")
+      (list-funs (sort (copy-list funs) #'< :key #'fourth)))
+
+    (format t "~%~|~A~%
+III. initially undefined function references (alphabetically):
+
+     FDEFN  INDEX  NAME
+==========  =====  ====~:{~%~[          ~:;~:*~10,'0X~]  ~5d  ~S~}~%"
+            *boilerplate-text*
+            (sort undefs
+                    (lambda (a b &aux (pkg-a (sb-xc:package-name (sb-xc:symbol-package a)))
+                                      (pkg-b (sb-xc:package-name (sb-xc:symbol-package b))))
+                      (cond ((string< pkg-a pkg-b) t)
+                            ((string> pkg-a pkg-b) nil)
+                            (t (string< a b))))
+                    :key (lambda (x) (fun-name-block-name (caddr x)))))))
+
+(defun write-map (*standard-output* &aux (*print-pretty* nil)
+                                         (*print-case* :upcase))
+  (format t "Table of contents~%")
+  (format t "=================~%")
+  (let ((sections '("assembler routines" "defined functions" "undefined functions"
+                    "classoids" "layouts"
+                    "packages" "symbols"
+                    "type specifiers"
+                    "linkage table" #+sb-thread "TLS map")))
+    (dotimes (i (length sections))
+      (format t "~4<~@R~>. ~A~%" (1+ i) (nth i sections))))
+  (format t "=================~2%")
+
+  (format t "I. assembler routines defined in core image: (base=~x)~2%"
+          (descriptor-bits *cold-assembler-obj*))
+  (dolist (routine *cold-assembler-routines*)
+    (let ((name (car routine)))
+      (format t "~8,'0X: ~S~%" (lookup-assembler-reference name) name)))
+
+  (write-function-map)
 
   (format t "~%~|~%IV. classoids:
 
@@ -3737,6 +3908,29 @@ III. initially undefined function references (alphabetically):
 
     (+ data-page page-count)))
 
+#+linker-space
+(defun output-linkage-table (data-page core-file)
+  (let* ((table *fname-table*)
+         (n-table-entries (length table))
+         (n-data-bytes (* n-table-entries sb-vm:n-word-bytes))
+         (data (make-bigvec)))
+    (expand-bigvec data n-data-bytes)
+    (loop for i from 1 below n-table-entries ; table index 0 isn't used
+          for offset from sb-vm:n-word-bytes by sb-vm:n-word-bytes
+          do (setf (bvref-word data offset)
+                   (cold-function-entry-point (aref table i))))
+    (force-output core-file) ; not sure if this does anything
+    (let ((posn (file-position core-file)))
+      (file-position core-file (* sb-c:+backend-page-bytes+ (1+ data-page)))
+      (write-bigvec-as-sequence data core-file :end n-data-bytes)
+      (force-output core-file)
+      (file-position core-file posn))
+    (format t "~&lisp linkage table: page=~D n-entries=~D~%" data-page n-table-entries)
+    (write-words core-file
+                 ;; 4 = number of words in this core header entry
+                 lisp-linkage-table-core-entry-type-code 4 n-table-entries data-page)
+    (+ data-page (ceiling n-data-bytes sb-vm:gencgc-page-bytes))))
+
 #+gencgc
 (defun output-page-table (gspace data-page core-file verbose)
   ;; Write as many PTEs as there are pages used.
@@ -3816,6 +4010,11 @@ III. initially undefined function references (alphabetically):
         (dovector (char build-id) (write-byte (char-code char) core-file))
         (dotimes (j (- padding)) (write-byte #xff core-file)))
 
+      ;; Write the function linkage table first. If present it'll be utilized when
+      ;; loading the directory. But the reason it's not in the directory itself
+      ;; is that it doesn't allocate a space: the table either has fixed address
+      ;; or else must be contiguous with immobile text space.
+      #+linker-space (setq data-page (output-linkage-table data-page core-file))
       ;; Write the Directory entry header.
       (write-words core-file directory-core-entry-type-code)
       (let ((spaces `(,*static*
@@ -3926,7 +4125,6 @@ III. initially undefined function references (alphabetically):
                                      #-gencgc sb-vm:dynamic-0-space-start))
            (*nil-descriptor*)
            (*simple-vector-0-descriptor*)
-           (*c-callable-fdefn-vector*)
            (*classoid-cells* (make-hash-table :test 'eq))
            (*ctype-cache* (make-hash-table :test 'equal))
            (*cold-layouts* (make-hash-table :test 'eq)) ; symbol -> cold-layout

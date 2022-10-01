@@ -1,0 +1,41 @@
+Advantages:
+
+* Linkage entries have 4x the density for any given number of function
+  names (1 word vs 4 for an fden),
+
+* Linkage cell is consumed only if compiled code calls compiled code.
+  (Never wasting a cell on macros, unless at some point the macro was
+  assumed to be a function)
+
+* The linkage table still uses 1-instruction call in the best case,
+  or 2-instruction worst case, which is the same as status quo.
+
+* Remove possible cross-cache-line misaligned store in remove-static-links
+  by doing away with so-called static linking.
+
+* Removes all :FDEFN-CALL and :STATIC-CALL absolute fixups
+
+* No storing machine code in the header of an fdefn, potentially
+  better for CPU by not cross-contaminating code and data.
+
+* Will eventually remove the restriction on sub-2GC text space.
+
+* Should generally work for #-immobile-space as well with no need to
+  reference code header constants to load an fdefn for call.
+
+Statistics on pristine core:
+- (length (sb-vm:list-allocated-objects :all :type sb-vm:fdefn-widetag))
+  Before: 15282, After: 3229
+
+- number of FBOUNDP symbols: 12017
+
+- number of linkage entries used: 6036
+
+- core size reduced by almost 200K
+
+Pending tasks:
+[x] stepping support - it seems to work
+[ ] use a mutex for assigning linkage index
+[ ] extend linkage index from 16 to 20 bits
+[ ] zeroize and re-use linkage table entry for GC'd symbols
+[ ] reduce invasiveness of the patches

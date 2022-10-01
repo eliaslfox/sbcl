@@ -18,27 +18,157 @@
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
-  #-immobile-space (make-fdefn name)
-  #+immobile-space
-  (let ((fdefn (truly-the (values fdefn &optional)
-                          (sb-vm::alloc-immobile-fdefn))))
-    (sb-vm::%set-fdefn-name fdefn name)
-    (fdefn-makunbound fdefn)
-    fdefn))
+  (make-fdefn name))
 
+;;;; lisp linkage table
+
+(define-load-time-global *fname-table-lock* (sb-thread:make-mutex :name "linker mutex"))
+(defun ensure-fname-exists (name)
+  (cond #+linker-space ((symbolp name) name) (t (find-or-create-fdefn name))))
+
+#+linker-space
+(progn
+(define-symbol-macro *fname-table* (extern-alien "lisp_linkage_table" system-area-pointer))
+(defun linkage-cell-address (index)
+  (sap-int (sap+ *fname-table* (ash index sb-vm:word-shift))))
+(defun linkage-table-ref (index)
+  (sap-ref-sap *fname-table* (ash index sb-vm:word-shift)))
+(define-symbol-macro *next-fname-index* (extern-alien "lisp_linkage_table_n_entries" int))
+
+(defun get-fname-linkage-index (fname)
+  (with-system-mutex (*fname-table-lock*)
+    (ash (get-lisp-obj-address
+          (etypecase fname
+            (symbol (%primitive sb-vm::slot fname 'symbol-function
+                                sb-vm:symbol-func-slot sb-vm:other-pointer-lowtag))
+            (fdefn  (%primitive sb-vm::slot fname 'sb-vm::fdefn-fun
+                                sb-vm:fdefn-fun-slot sb-vm:other-pointer-lowtag))))
+         (- sb-vm::symbol-function-bits))))
+
+(export 'get-linkage-entry)
+(defun get-linkage-entry (fname)
+  (let ((index (get-fname-linkage-index (ensure-fname-exists fname))))
+    (if (zerop index)
+        (values nil nil)
+        (let ((value (linkage-table-ref index)))
+          (values (sb-di::code-header-from-pc value) value)))))
+
+;;; Assign EXECUTABLE into the linkage table at specifed INDEX,
+;;; also indicating that FNAME was touched
+(defun set-lisp-linkage-cell (fname index executable)
+  (with-pinned-objects (executable)
+    ;; Linkage cell logically belongs to FNAME and can create old->young pointer
+    ;; (so that linkage space does not need to be considered a GC root)
+    (%primitive sb-vm::gc-store-barrier fname)
+    (let ((entrypoint
+           (sap+ (int-sap (get-lisp-obj-address executable))
+                 (etypecase executable
+                   (code-component
+                    (- (ash 4 sb-vm:word-shift) sb-vm:other-pointer-lowtag))
+                   (function
+                    ;; Should this read the fun-self word?
+                    (- (ash 2 sb-vm:word-shift) sb-vm:fun-pointer-lowtag))))))
+    ;; It's essential to give the linkage entry a valid value
+    ;; before publishing that the fname has that index.
+    ;; Consider the reverse order: someone reads the index, deems it good,
+    ;; emits an instruction to call it, invokes that instruction, jumps
+    ;; to 0, all before this thread has stored into the table.
+    (setf (sap-ref-sap *fname-table* (ash index sb-vm:word-shift))
+          entrypoint)))
+  (sb-thread:barrier (:write)))
+
+(defun ensure-fname-linkage-index (designator
+                                   &aux (fname (if (typep designator '(or symbol fdefn))
+                                                   designator
+                                                   (find-or-create-fdefn designator))))
+  ;; FNAME is either a symbol or an fdefn
+  ;; Preserve the FUNCTION part of the function field
+  ;; FIXME: compare-and-swap etc
+  (with-pinned-objects (fname)
+    (let* ((slot-offset
+            (etypecase fname
+              (symbol (- (ash sb-vm:symbol-func-slot sb-vm:word-shift)
+                         sb-vm:other-pointer-lowtag))
+              (fdefn (- (ash sb-vm:fdefn-fun-slot sb-vm:word-shift)
+                        sb-vm:other-pointer-lowtag))))
+           (bits (sap-ref-word (int-sap (get-lisp-obj-address fname)) slot-offset))
+           (index (ash bits (- sb-vm::symbol-function-bits)))
+           (current-definition
+            ;; FIXME: unsafe
+            (%make-lisp-obj (ldb (byte sb-vm::symbol-function-bits 0) bits))))
+      (unless (zerop index)
+        (return-from ensure-fname-linkage-index index))
+
+      ;; outside of acquiring any locks on the fname table,
+      ;; make a closure-calling trampoline now if needed.
+      (let ((executable
+             (cond ((null current-definition) (error "can't happen"))
+                   ((eql current-definition 0) (sb-vm:make-trampoline fname))
+                   ((closurep current-definition) (sb-vm:make-trampoline current-definition))
+                   (t current-definition))))
+        (with-pinned-objects (executable)
+          (with-system-mutex (*fname-table-lock*)
+            ;; FIXME: double-check that index is zero
+            ;; Choose the table index
+            (setq index *next-fname-index*
+                  *next-fname-index* (1+ index))
+            (set-lisp-linkage-cell fname index executable)
+            ;; Now that the fname linker table contains a directly callable
+            ;; entry point it is safe to assign the table index into the FNAME.
+            (setf (sap-ref-word (int-sap (get-lisp-obj-address fname)) slot-offset)
+                  (logior (ash index sb-vm::symbol-function-bits)
+                          (get-lisp-obj-address current-definition))))))
+      index)))
+
+(defun set-fname-function (fname function)
+  ;; FNAME is either a symbol or an fdefn
+  ;; Preserve the linker-index part of the function field
+  ;; And install a trampoline if we need it.
+  (declare (type (or function (eql 0)) function))
+  (with-pinned-objects (fname function)
+    (with-system-mutex (*fname-table-lock*)
+      (let* ((slot-offset
+              (etypecase fname
+                (symbol (- (ash sb-vm:symbol-func-slot sb-vm:word-shift) sb-vm:other-pointer-lowtag))
+                (fdefn  (- (ash sb-vm:fdefn-fun-slot sb-vm:word-shift) sb-vm:other-pointer-lowtag))))
+             (old (sap-ref-word (int-sap (get-lisp-obj-address fname)) slot-offset))
+             (index (ash old (- sb-vm::symbol-function-bits)))
+             (new (dpb (get-lisp-obj-address function) (byte sb-vm::symbol-function-bits 0) old))
+             (executable
+              (when (plusp index)
+                (cond ((eql function 0) (sb-vm:make-trampoline fname))
+                      ((closurep function) (sb-vm:make-trampoline function))
+                      (t function)))))
+        (%primitive sb-vm::gc-store-barrier fname)
+        (when (plusp index)
+          (set-lisp-linkage-cell fname index executable))
+        (typecase fname
+          (symbol (%primitive sb-vm::set-slot fname (%make-lisp-obj new) '(setf symbol-function)
+                              sb-vm:symbol-func-slot sb-vm:other-pointer-lowtag))
+          (fdefn
+           (%primitive sb-vm::set-slot fname (%make-lisp-obj new) '(setf fdefinition)
+                       sb-vm:fdefn-fun-slot sb-vm:other-pointer-lowtag))))))
+  function)
+) ; end PROGN
+
+#-linker-space
 (defun (setf fdefn-fun) (fun fdefn)
   (declare (type function fun)
            (type fdefn fdefn)
            (values function))
-  #+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
-  #-immobile-code (setf (fdefn-fun fdefn) fun))
+  (setf (fdefn-fun fdefn) fun))
+
+;;;;
 
 ;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
 ;;; Signal an error if name isn't valid.
 ;;; Assume that exists-p implies LEGAL-FUN-NAME-P.
-(declaim (ftype (sfunction ((or symbol list)) (or fdefn null)) find-fdefn))
+;;; If #+linker-space then FDEFNs can only be created for names that aren't symbols.
+(declaim (ftype (sfunction ((or cons #-linker-space symbol)) (or fdefn null)) find-fdefn))
 (defun find-fdefn (name)
   (declare (explicit-check))
+  #+linker-space (aver (not (symbolp name)))
+  #-linker-space
   (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
     (let ((fdefn (sb-vm::%symbol-fdefn name))) ; slot default is 0, not NIL
       (return-from find-fdefn (if (eql fdefn 0) nil fdefn))))
@@ -98,10 +228,12 @@
                   symbol))
           (t def))))
 
-(declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
+(declaim (ftype (sfunction ((or cons #-linker-space symbol)) fdefn) find-or-create-fdefn))
 (defun find-or-create-fdefn (name)
   (cond
     ((symbolp name)
+     #+linker-space (find-fdefn name) ; will signal error
+     #-linker-space
      (let ((fdefn (sb-vm::%symbol-fdefn name)))
        (if (eql fdefn 0)
            (let* ((new (make-fdefn name))
@@ -224,8 +356,7 @@
 ;;; encapsulation for identification in case you need multiple
 ;;; encapsulations of the same name.
 (defun encapsulate (name type function)
-  (let* ((fdefn (find-fdefn name))
-         (underlying-fun (sb-c:safe-fdefn-fun fdefn)))
+  (let ((underlying-fun (%coerce-name-to-fun name)))
     (when (macro/special-guard-fun-p underlying-fun)
       (error "~S can not be encapsulated" name))
     (when (typep underlying-fun 'generic-function)
@@ -241,7 +372,7 @@
     ;; basic-definition to be bound to the next definition instead of
     ;; an encapsulation that no longer exists.
     (let ((info (make-encapsulation-info type underlying-fun)))
-      (setf (fdefn-fun fdefn)
+      (set-fname-function name
             (named-lambda encapsulation (&rest args)
               (apply function (encapsulation-info-definition info)
                      args))))))
@@ -366,6 +497,11 @@
            :format-control "~S is not acceptable to ~S."
            :format-arguments (list object setter))))
 
+(defmacro fname-fun (x)
+  ;; If #+linker-space, an FNAME is (OR SYMBOL FDEFN), otherwise just FDEFN
+  #+linker-space `(if (symbolp ,x) (%symbol-function ,x) (fdefn-fun ,x))
+  #-linker-space `(fdefn-fun ,x))
+
 (defun (setf fdefinition) (new-value name)
   "Set NAME's global function definition."
   (declare (type function new-value) (optimize (safety 1)))
@@ -374,7 +510,6 @@
   (setq new-value (strip-encapsulation new-value))
   (with-single-package-locked-error (:symbol name "setting fdefinition of ~A")
     (maybe-clobber-ftype name new-value)
-
     ;; Check for hash-table stuff. Woe onto him that mixes encapsulation
     ;; with this.
     (when (symbolp name)
@@ -387,11 +522,11 @@
                    ;; hash-function
                    (setf (third spec) new-value))))))
 
-    (let ((fdefn (find-or-create-fdefn name)))
+    (let ((fname (if (or #+linker-space (symbolp name)) name (find-or-create-fdefn name))))
       (dolist (f *setf-fdefinition-hook*)
         (declare (type function f))
         (funcall f name new-value))
-      (let ((encap-info (encapsulation-info (fdefn-fun fdefn))))
+      (let ((encap-info (encapsulation-info (fname-fun fname))))
         (cond (encap-info
                (loop
                 (let ((more-info
@@ -402,26 +537,30 @@
                       (return (setf (encapsulation-info-definition encap-info)
                                     new-value))))))
               (t
-               (setf (fdefn-fun fdefn) new-value)))))))
+               #-linker-space (setf (fdefn-fun fname) new-value)
+               #+linker-space (set-fname-function fname new-value)))))
+    new-value))
 
 ;;;; FBOUNDP and FMAKUNBOUND
 
 (defun fboundp (name)
   "Return true if name has a global function definition."
   (declare (explicit-check))
-  (awhen (find-fdefn name) (fdefn-fun it)))
+  (acond #+linker-space
+         ((typep name '(and symbol (not null)))
+          ;; un-fboundp symbols have 0, not NIL in the field
+          (let ((f (%primitive sb-vm::fast-symbol-function name))) (if (eql f 0) nil f)))
+         ((null name) nil)
+         ((find-fdefn name) (fdefn-fun it))))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
   (declare (explicit-check))
   (with-single-package-locked-error
       (:symbol name "removing the function or macro definition of ~A")
-    (let ((fdefn (find-fdefn name)))
-      (when fdefn
-        #+immobile-code
-        (when (sb-vm::fdefn-has-static-callers fdefn)
-          (sb-vm::remove-static-links fdefn))
-        (fdefn-makunbound fdefn)))
+    (acond #+linker-space ((symbolp name) (set-fname-function name 0))
+           ((find-fdefn name) #+linker-space (set-fname-function it 0)
+                              #-linker-space (fdefn-makunbound it)))
     (undefine-fun-name name)
     name))
 

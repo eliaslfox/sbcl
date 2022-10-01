@@ -479,6 +479,7 @@ structure representations")
            "MAX-INTERRUPTS"
            #+c-stack-is-control-stack "MEMORY-FAULT-EMULATION-TRAP"
            "UNINITIALIZED-LOAD-TRAP"
+           "MAKE-TRAMPOLINE"
            "METASPACE-SLAB-SIZE"
            "MEMORY-USAGE"
            "N-LOWTAG-BITS"
@@ -580,6 +581,7 @@ structure representations")
            "SYMBOL-HASH-SLOT" "SYMBOL-WIDETAG" "SYMBOL-NAME-SLOT"
            "SYMBOL-PACKAGE-ID-SLOT" "SYMBOL-INFO-SLOT" "SYMBOL-FDEFN-SLOT"
            "SYMBOL-SIZE" "SYMBOL-VALUE-SLOT" "SYMBOL-TLS-INDEX-SLOT"
+           "SYMBOL-FUNC-SLOT"
            "*BINDING-STACK-START*"
            "*CONTROL-STACK-START*" "*CONTROL-STACK-END*"
            "CONTROL-STACK-POINTER-VALID-P"
@@ -2998,6 +3000,9 @@ possibly temporarily, because it might be used internally.")
            "UPDATE-SYMBOL-INFO"
            "WITH-GLOBALDB-NAME"
            "%BOUNDP"
+           "GET-FNAME-LINKAGE-INDEX"
+           "ENSURE-FNAME-LINKAGE-INDEX"
+           "LINKAGE-CELL-ADDRESS"
 
             ;; Calling a list of hook functions, plus error handling.
 

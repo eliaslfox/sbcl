@@ -2722,6 +2722,7 @@ is :ANY, the function name is not checked."
                           (values t boolean))
                 careful-call))
 (defun careful-call (function args)
+;;  #-sb-xc-host (format t "~&Gonna careful call ~A ~A~%" function args)
   (handler-case (values (multiple-value-list (apply function args)) t)
     ;; When cross-compiling, being "careful" is the wrong thing - our code should
     ;; not allowed malformed or out-of-order definitions to proceed as if all is well.
